@@ -27,16 +27,24 @@ use comptr::ComPtr;
 use std::ptr;
 use std::os::raw::c_void;
 use std::os::windows::ffi::OsStringExt;
+use std::ops::Deref;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use winapi::BOOL;
 use winit::os::windows::WindowExt;
 
+use core::command::Submit;
+
+mod command;
 mod data;
 mod factory;
 mod mirror;
 mod native;
+mod pool;
 mod state;
+
+pub use pool::{GeneralCommandPool, GraphicsCommandPool,
+    ComputeCommandPool, TransferCommandPool, SubpassCommandPool};
 
 #[derive(Clone)]
 pub struct QueueFamily;
@@ -64,10 +72,11 @@ pub struct Adapter {
 
 impl core::Adapter for Adapter {
     type CommandQueue = CommandQueue;
-    type Device = Device;
+    type Resources = Resources;
+    type Factory = Factory;
     type QueueFamily = QueueFamily;
 
-    fn open<'a, I>(&self, queue_descs: I) -> (Device, Vec<CommandQueue>)
+    fn open<'a, I>(&self, queue_descs: I) -> core::Device<Resources, Factory, CommandQueue>
         where I: Iterator<Item=(&'a QueueFamily, u32)>
     {
         // Create D3D12 device
@@ -81,11 +90,12 @@ impl core::Adapter for Adapter {
             )
         };
         if !winapi::SUCCEEDED(hr) {
-            error!("error on device creation: {:?}", hr);
+            error!("error on device creation: {:x}", hr);
         }
 
+        // TODO: other queue types
         // Create command queues
-        let queues = queue_descs.flat_map(|(_family, queue_count)| {
+        let mut general_queues = queue_descs.flat_map(|(_family, queue_count)| {
             (0..queue_count).map(|_| {
                 let mut queue = ComPtr::<winapi::ID3D12CommandQueue>::new(ptr::null_mut());
                 let queue_desc = winapi::D3D12_COMMAND_QUEUE_DESC {
@@ -104,14 +114,31 @@ impl core::Adapter for Adapter {
                 };
 
                 if !winapi::SUCCEEDED(hr) {
-                    error!("error on queue creation: {:?}", hr);
+                    error!("error on queue creation: {:x}", hr);
                 }
 
-                CommandQueue { inner: queue }
+                unsafe {
+                    core::GeneralQueue::new(
+                        CommandQueue {
+                            inner: queue,
+                            device: device.clone(),
+                            list_type: winapi::D3D12_COMMAND_LIST_TYPE_DIRECT, // TODO
+                        }
+                    )
+                }
             }).collect::<Vec<_>>()
         }).collect();
 
-        (Device { inner: device }, queues)
+        let factory = Factory::new(device);
+
+        core::Device {
+            factory: factory,
+            general_queues: general_queues,
+            graphics_queues: Vec::new(),
+            compute_queues: Vec::new(),
+            transfer_queues: Vec::new(),
+            _marker: std::marker::PhantomData,
+        }
     }
 
     fn get_info(&self) -> &core::AdapterInfo {
@@ -123,23 +150,72 @@ impl core::Adapter for Adapter {
     }
 }
 
-pub struct Device {
+pub struct Factory {
     inner: ComPtr<winapi::ID3D12Device>,
+
+    rtv_heap: ComPtr<winapi::ID3D12DescriptorHeap>, // TODO: temporary cpu heap
+    rtv_handle_size: u64,
+    next_rtv: usize
 }
 
-impl core::Device for Device {
+impl Factory {
+    fn new(mut device: ComPtr<winapi::ID3D12Device>) -> Factory {
+        let rtv_heap = {
+            let heap_desc = winapi::D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: winapi::D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 64,
+                Flags: winapi::D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            };
 
+            let mut heap = ComPtr::<winapi::ID3D12DescriptorHeap>::new(ptr::null_mut());
+            unsafe {
+                device.CreateDescriptorHeap(
+                    &heap_desc,
+                    &dxguid::IID_ID3D12DescriptorHeap,
+                    heap.as_mut() as *mut *mut _ as *mut *mut c_void,
+                );
+            }
+
+            heap
+        };
+
+        let rtv_descriptor_size = unsafe {
+            device.GetDescriptorHandleIncrementSize(winapi::D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as u64
+        };
+
+        Factory {
+            inner: device,
+            rtv_heap: rtv_heap,
+            rtv_handle_size: rtv_descriptor_size,
+            next_rtv: 0,
+        }
+    }
 }
 
 pub struct CommandQueue {
     inner: ComPtr<winapi::ID3D12CommandQueue>,
+    device: ComPtr<winapi::ID3D12Device>,
+    list_type: winapi::D3D12_COMMAND_LIST_TYPE,
 }
 
 impl core::CommandQueue for CommandQueue {
-    type CommandBuffer = ();
+    type R = Resources;
+    type SubmitInfo = command::SubmitInfo;
+    type GeneralCommandBuffer = native::GeneralCommandBuffer;
+    type GraphicsCommandBuffer = native::GraphicsCommandBuffer;
+    type ComputeCommandBuffer = native::ComputeCommandBuffer;
+    type TransferCommandBuffer = native::TransferCommandBuffer;
+    type SubpassCommandBuffer = native::SubpassCommandBuffer;
 
-    fn submit(&mut self, cmd_buffer: &()) {
-        unimplemented!()
+    unsafe fn submit<C>(&mut self, submit: &[Submit<C>])
+        where C: core::CommandBuffer<SubmitInfo = command::SubmitInfo>
+    {
+        let mut command_lists = submit.iter().map(|submit| {
+            submit.get_info().0.as_mut_ptr()
+        }).collect::<Vec<_>>();
+
+        self.inner.ExecuteCommandLists(command_lists.len() as u32, command_lists.as_mut_ptr() as *mut *mut _);
     }
 }
 
@@ -151,16 +227,17 @@ pub struct Surface {
 }
 
 impl core::Surface for Surface {
-    type CommandQueue = CommandQueue;
+    type Queue = CommandQueue;
     type SwapChain = SwapChain;
 
     fn build_swapchain<T: core::format::RenderFormat>(&self, present_queue: &CommandQueue) -> SwapChain {
         let mut swap_chain = ComPtr::<winapi::IDXGISwapChain1>::new(ptr::null_mut());
+        let buffer_count = 2; // TODO: user-defined value
 
         // TODO: double-check values
         let desc = winapi::DXGI_SWAP_CHAIN_DESC1 {
             AlphaMode: winapi::DXGI_ALPHA_MODE(0),
-            BufferCount: 2,
+            BufferCount: buffer_count,
             Width: self.width,
             Height: self.height,
             Format: data::map_format(T::get_format(), true).unwrap(), // TODO: error handling
@@ -190,27 +267,55 @@ impl core::Surface for Surface {
             error!("error on swapchain creation {:x}", hr);
         }
 
+        let mut swap_chain = ComPtr::<winapi::IDXGISwapChain3>::new(swap_chain.as_mut_ptr() as *mut winapi::IDXGISwapChain3);
+
+        // Get backbuffer images
+        let backbuffers = (0..buffer_count).map(|i| {
+            let mut resource = ComPtr::<winapi::ID3D12Resource>::new(ptr::null_mut());
+            unsafe {
+                swap_chain.GetBuffer(
+                    i,
+                    &dxguid::IID_ID3D12Resource,
+                    resource.as_mut() as *mut *mut _ as *mut *mut c_void);
+            }
+
+            native::Image { resource: resource }
+        }).collect::<Vec<_>>();
+
         SwapChain {
             inner: swap_chain,
             next_frame: 0,
             frame_queue: VecDeque::new(),
+            images: backbuffers,
         }
     }
 }
 
 pub struct SwapChain {
-    inner: ComPtr<winapi::IDXGISwapChain1>,
+    inner: ComPtr<winapi::IDXGISwapChain3>,
     next_frame: usize,
     frame_queue: VecDeque<usize>,
+    images: Vec<native::Image>,
 }
 
 impl<'a> core::SwapChain for SwapChain{
+    type Image = native::Image;
+
+    fn get_images(&mut self) -> &[native::Image] {
+        &self.images
+    }
+
     fn acquire_frame(&mut self) -> core::Frame {
-        // TODO: we need to block this at some point?
+        // TODO: we need to block this at some point? (running out of backbuffers)
+        let num_images = self.images.len();
         let index = self.next_frame;
         self.frame_queue.push_back(index);
-        self.next_frame = (self.next_frame + 1) % 2; // TODO: remove magic swap buffer count
-        core::Frame::new(index)
+        self.next_frame = (self.next_frame + 1) % num_images;
+        unsafe { core::Frame::new(index) };
+
+        // TODO:
+        let index = unsafe { self.inner.GetCurrentBackBufferIndex() };
+        unsafe { core::Frame::new(index as usize) }
     }
 
     fn present(&mut self) {
@@ -334,11 +439,9 @@ impl core::Instance for Instance {
 }
 
 pub enum Backend { }
-
 impl core::Backend for Backend {
-    type CommandBuffer = ();
     type CommandQueue = CommandQueue;
-    type Device = Device;
+    type Factory = Factory;
     type Instance = Instance;
     type Adapter = Adapter;
     type Resources = Resources;
@@ -348,17 +451,20 @@ impl core::Backend for Backend {
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Resources { }
-
 impl core::Resources for Resources {
-    type Buffer = ();
     type ShaderLib = native::ShaderLib;
-    type RenderPass = ();
-    type PipelineSignature = native::PipelineSignature;
-    type PipelineStateObject = native::Pipeline;
-    type Image = ();
+    type RenderPass = native::RenderPass;
+    type PipelineLayout = native::PipelineLayout;
+    type GraphicsPipeline = native::GraphicsPipeline;
+    type ComputePipeline = native::ComputePipeline;
+    type Buffer = native::Buffer;
+    type Image = native::Image;
     type ShaderResourceView = ();
     type UnorderedAccessView = ();
-    type RenderTargetView = ();
-    type DepthStencilView = ();
+    type RenderTargetView = native::RenderTargetView;
+    type DepthStencilView = native::DepthStencilView;
+    type FrameBuffer = native::FrameBuffer;
     type Sampler = ();
+    type Fence = ();
+    type Semaphore = ();
 }
