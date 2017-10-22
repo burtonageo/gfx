@@ -25,14 +25,10 @@ fn main() {
         .collect();
     let stride = std::mem::size_of::<u32>() as u64;
 
-    #[cfg(any(feature = "vulkan", feature = "dx12"))]
     let instance = back::Instance::create("gfx-rs compute", 1);
 
-    #[cfg(feature = "metal")]
-    let instance = back::Instance::create();
-
     let mut gpu = instance.enumerate_adapters().into_iter()
-        .find(|a| a.get_queue_families().into_iter().any(|&(_, t)| t.supports_compute()))
+        .find(|a| a.queue_families().into_iter().any(|&(_, t)| t.supports_compute()))
         .expect("Failed to find a GPU with compute support!")
         .open_with(|_, qtype| {
             if qtype.supports_compute() {
